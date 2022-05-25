@@ -1,51 +1,32 @@
 //
 //  ViewController.swift
-//  Desync
 //
 // This project simulates an issue when trying to use Metal in conjuction
-// with UIKit. Specifically, it highlights that when using the recommended
-// method specified by Apple in the documentation (1) for .presentsWithTransaction
-// on CAMetalLayer: if a spike in CPU usage occurs the render loop can become
-// starved of drawables – apparently desynchronised – until subsequent CPU spike
-// knocks it back into sync.
-//
-// This project simulates this issue in nearly the simplest Metal project possible
-// (drawing a single quad to screen) and simulating a typical background load
-// (a short wait on each frame of the render loop).
-//
-// In usual operation, the duration for the CPU to submit and schedule its work on
-// the GPU is ~1ms. However, when a CPU spike occurs, desynchronisation may take
-// place after which this can rise to around ~8ms. (This can be simulated by
-// pressing the 'do heavy work button' which will force a short delay on the main
-// thread.) Observing this behaviour in the Metal instruments panel, we can see
-// that the render loop is becoming blocked waiting for a drawable on each frame.
-// A subsequent CPU spike can knock the render loop back into sync.
-//
-// This wait on the main thread seems to cause issues elsewhere in UIKit. In the
-// example project, you can see that when the loop is desynchronised dragging the
-// circle appears jerky – touch events appear delayed.
-//
-// Desynchronisation only seems to occur if there is some quantity of work
-// occuring on the main thread. On an iPhone X, 6ms worth seems to expose the
-// issue, but this may need to be tweaked for other devices. Usually, pressing
-// the 'do heavy work' button a couple of times will cause a desync/resync to
-// occur, but occasionally requires a few more.
-//
-// 1: https://developer.apple.com/documentation/quartzcore/cametallayer/1478157-presentswithtransaction
+// with UIKit. Specifically, it highlights a likely bug in Apple's driver / internal
+// implementation of GPU throttling and waiting for the next drawable on iOS.
+
+// On:
+// iPhone 11 Pro - 15.4.1
+// When we run this project at forced maximum GPU performance state through XCode, the
+// frame rate is 60 FPS and GPU total frame time is 8.5ms. When we run the project normally
+// (without any forced states) the total CPU frame time jumps to 25ms, GPU frame time jumps
+// to 19ms, and frame rate drops to steady 40 FPS. In that case, we can observe long CPU main
+// thread blocked waiting for next drawable times in Instruments, and on the GPU side
+// we observe GPU not being busy all of the time (likely due to GPU/CPU bubbles).
+
+// On:
+// iPhone 12 Pro - 14.8.1
+// iPhone 12 mini - 15.4
+// iPhone 10 - 15.4.1
+// You can observe 40 FPS (25ms CPU, ~20ms GPU per frame time) in the first 3-4 seconds after
+// project startup, then it recovers to 60 FPS.
 
 import UIKit
 import MetalKit
 
-// MARK: - App constants
-// the duration for which the main thread will be delayed (usleep) when the
-// 'heavy work' button is pressed to simulate in in-app/system CPU spike
-// and consequential delay on the main thread.
-let heavyWorkSimulatedDelayMicroseconds = UInt32(200_000)
-
-// the duration for which the main thread will be delayed each frame to simulate
-// work undertaken to update state or other necessary work that is completed each
-// frame. A value of 6_000 seems to expose the issue on an iPhone X.
-let stateUpdatePerFrameSimulatedDelayMicroseconds = UInt32(8_000)
+// Switching this flag to true enables .presentsWithTransaction, workarounds this
+// bug and restores frames per second from 40 FPS -> 60 FPS
+let presentWithTransactionWorkaround = false
 
 final class MetalKitViewController: UIViewController {
     
@@ -56,7 +37,6 @@ final class MetalKitViewController: UIViewController {
     private let library: MTLLibrary
     
     lazy private var metalKitView = MTKView(frame: .zero, device: device)
-    lazy private var overlayView = OverlayView(frame: .zero)
     
     var pipelineState: MTLRenderPipelineState?
     var vertexBuffer: MTLBuffer?
@@ -127,16 +107,11 @@ extension MetalKitViewController {
         metalKitView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         metalKitView.delegate = self
         metalKitView.clearColor =  MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        //metalKitView.presentsWithTransaction = true
+        metalKitView.presentsWithTransaction = presentWithTransactionWorkaround
         
         containerView.addSubview(metalKitView)
         
-        overlayView.frame = containerView.bounds
-        overlayView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        
-        containerView.addSubview(overlayView)
-        
-        self.view = containerView
+        self.view = metalKitView
     }
 }
 
@@ -146,17 +121,6 @@ extension MetalKitViewController: MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     
     func draw(in view: MTKView) {
-        
-        // update label
-        
-        overlayView.frameRateLabel.text = "\(String(format: "%.3f", waitTimeAverage * 1000)) ms"
-        
-        // simulate state update/arbitrary CPU work
-        
-        usleep(stateUpdatePerFrameSimulatedDelayMicroseconds)
-        
-        let nextDrawableRequestTime = CACurrentMediaTime()
-        
         guard
             let commandBuffer = commandQueue.makeCommandBuffer(),
             let pipelineState = pipelineState,
@@ -168,19 +132,21 @@ extension MetalKitViewController: MTKViewDelegate {
         commandEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         commandEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: vertices.count)
         commandEncoder.endEncoding()
+        if (!presentWithTransactionWorkaround) {
+            let mtl_drawable = self.metalKitView.currentDrawable
+            commandBuffer.addScheduledHandler { cb in
+                mtl_drawable?.present()
+            }
+        }
         commandBuffer.commit()
+
+        if (presentWithTransactionWorkaround) {
+            // Wait until current buffer scheduled, connected to presentsWithTransaction
+            commandBuffer.waitUntilScheduled()
         
-        // Wait until current buffer scheduled
-        
-        commandBuffer.waitUntilScheduled()
-        
-        metalKitView.currentDrawable?.present()
-        
-        updateWaitTimeAverage(CACurrentMediaTime() - nextDrawableRequestTime)
-    }
-    
-    private func updateWaitTimeAverage(_ waitTime: Double) {
-        waitTimeAverage = (waitTime * lowPassFactor) + (waitTimeAverage * (1-lowPassFactor))
+            // Alternative present, connected to presentsWithTransaction
+            metalKitView.currentDrawable?.present()
+        }
     }
 }
 
@@ -209,82 +175,4 @@ extension Vertex {
         vertexDescriptor.layouts[0].stride = MemoryLayout<Vertex>.stride
         return vertexDescriptor
     }()
-}
-
-// MARK: - Overlay view definition
-final class OverlayView: UIView {
-    
-    // MARK: - Properties
-    
-    lazy var frameRateLabel = UILabel(frame: .zero)
-    
-    lazy var heavyWorkButton: UIButton = {
-        let button = UIButton(type: .system)
-        button.setTitle("Do Heavy Work", for: .normal)
-        button.titleLabel?.font = UIFont.systemFont(ofSize: 36)
-        return button
-    }()
-    
-    lazy private var dragView: UIView = {
-        let dragView = UIView(frame: .zero)
-        dragView.backgroundColor = .gray
-        dragView.layer.cornerRadius = 100
-        return dragView
-    }()
-    
-    private lazy var panGestureRecognizer = UIPanGestureRecognizer(
-        target: self, action: #selector(panGestureRecognizerDidUpdate))
-    
-    // MARK: - Initialiser
-    
-    override init(frame: CGRect) {
-        
-        super.init(frame: frame)
-        
-        dragView.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
-        dragView.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        dragView.addGestureRecognizer(panGestureRecognizer)
-        dragView.autoresizingMask = [
-            .flexibleTopMargin,
-            .flexibleRightMargin,
-            .flexibleBottomMargin,
-            .flexibleLeftMargin
-        ]
-        addSubview(dragView)
-        
-        frameRateLabel.backgroundColor = .clear
-        frameRateLabel.textColor = .white
-        frameRateLabel.font = UIFont.systemFont(ofSize: 72, weight: .heavy)
-        frameRateLabel.textAlignment = .center
-        frameRateLabel.frame = CGRect(x: 0, y: 50, width: bounds.size.width, height: 72)
-        frameRateLabel.autoresizingMask = [.flexibleWidth, .flexibleBottomMargin]
-        addSubview(frameRateLabel)
-        
-        heavyWorkButton.frame = CGRect(x: 0, y: bounds.size.height - 120, width: 0, height: 80)
-        heavyWorkButton.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
-        heavyWorkButton.addTarget(self, action: #selector(buttonAction), for: .touchUpInside)
-        addSubview(heavyWorkButton)
-    }
-    
-    required init?(coder aDecoder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    // MARK: - Input handlers
-    
-    @objc private func panGestureRecognizerDidUpdate(_ gestureRecognizer: UIPanGestureRecognizer) {
-        switch gestureRecognizer.state {
-        case .changed:
-            let currentSample = gestureRecognizer.translation(in: self)
-            dragView.transform = CGAffineTransform(translationX: currentSample.x, y: currentSample.y)
-        case .ended:
-            dragView.transform = .identity
-        default: break
-        }
-    }
-    
-    @objc private func buttonAction(_ sender: UIButton) {
-        // simulate arbitrary/intermittent CPU spike
-        usleep(heavyWorkSimulatedDelayMicroseconds)
-    }
 }

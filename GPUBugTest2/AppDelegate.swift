@@ -16,11 +16,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         else { preconditionFailure("Unable to setup Metal device") }
         
         guard
-        let commandQueue = device.makeCommandQueue()
+            let commandQueue = device.makeCommandQueue()
         else { preconditionFailure("Unable to setup Metal device 2") }
         
         guard
-        let library = device.makeDefaultLibrary()
+            let library = device.makeDefaultLibrary()
         else { preconditionFailure("Unable to setup Metal device 3") }
         
         let window = UIWindow(frame: UIScreen.main.bounds)
